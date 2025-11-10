@@ -842,8 +842,26 @@
 
     <script>
         
-// === INÍCIO: Carregamento automático da Google Planilha publicada ===
-const SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSju9gP6RC3zHnt5qHlUPuqJMKCqr2TIQ0y7RIhEhGkuUZLGjzKCp6M0kYnqmkLEKJQXNEZycZgCSv6/pubhtml?gid=0&single=true";
+
+// === INÍCIO: Carregamento automático da Google Planilha publicada (via CSV com CORS) ===
+const RAW_SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSju9gP6RC3zHnt5qHlUPuqJMKCqr2TIQ0y7RIhEhGkuUZLGjzKCp6M0kYnqmkLEKJQXNEZycZgCSv6/pubhtml?gid=0&single=true";
+
+function toCsvUrl(u) {
+  try {
+    const url = new URL(u);
+    // troca /pubhtml por /pub e garante output=csv
+    url.pathname = url.pathname.replace(/\/pubhtml$/, "/pub");
+    // mantém gid e single=true, força output=csv
+    if (!url.searchParams.has("gid")) url.searchParams.set("gid", "0");
+    url.searchParams.set("single", "true");
+    url.searchParams.set("output", "csv");
+    return url.toString();
+  } catch (e) {
+    return u; // fallback
+  }
+}
+
+const SHEET_CSV_URL = toCsvUrl(RAW_SHEET_URL);
 
 // Normaliza strings para comparação de headers (remove acentos e padroniza)
 function normalizeHeader(s) {
@@ -855,88 +873,107 @@ function normalizeHeader(s) {
     .trim();
 }
 
+// Conversor CSV -> array de objetos
+function parseCSV(text) {
+  // Parse robusto simples (suporta aspas)
+  const rows = [];
+  let cur = '', row = [], inside = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      if (inside && text[i+1] === '"') { cur += '"'; i++; }
+      else { inside = !inside; }
+    } else if (c === ',' && !inside) {
+      row.push(cur); cur='';
+    } else if ((c === '\n' || c === '\r') && !inside) {
+      if (cur !== '' || row.length) { row.push(cur); rows.push(row); row = []; cur=''; }
+    } else {
+      cur += c;
+    }
+  }
+  if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
+  return rows;
+}
+
 let csvData = [];
 async function loadSheetData() {
   try {
-    const res = await fetch(SHEET_URL, { cache: "no-store" });
-    const html = await res.text();
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, "text/html");
-    const table = doc.querySelector("table.waffle");
-    if (!table) throw new Error("Tabela publicada (waffle) não encontrada no HTML do Google Sheets.");
+    const res = await fetch(SHEET_CSV_URL, { cache: "no-store", mode: "cors" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const text = await res.text();
+    const rows = parseCSV(text);
+    if (!rows || rows.length < 2) throw new Error("CSV sem linhas suficientes.");
+    const header = rows[0].map(h => normalizeHeader(h));
 
-    const rows = Array.from(table.querySelectorAll("tr"));
-    if (rows.length < 2) throw new Error("Planilha sem linhas suficientes.");
-
-    // Lê headers
-    const headerCells = Array.from(rows[0].querySelectorAll("th,td")).map(td => normalizeHeader(td.textContent));
-    const headerMap = {
-      empresa: headerCells.findIndex(h => h.includes("empresa")),
-      mes: headerCells.findIndex(h => h.includes("mes")),
-      ano: headerCells.findIndex(h => h.includes("ano")),
-      linhaProduto: headerCells.findIndex(h => h.includes("linha") && h.includes("produto")),
-      produto: headerCells.findIndex(h => h.includes("produto") && !h.includes("linha")),
-      metaVGV: headerCells.findIndex(h => (h.includes("meta") && h.includes("vgv")) || h.includes("meta vgv")),
-      realVGV: headerCells.findIndex(h => (h.includes("real") && h.includes("vgv")) || h.includes("real vgv")),
-      metaQtd: headerCells.findIndex(h => (h.includes("meta") && (h.includes("qtd")||h.includes("quant"))) ),
-      realQtd: headerCells.findIndex(h => (h.includes("real") && (h.includes("qtd")||h.includes("quant"))) ),
-      estoqueVGV: headerCells.findIndex(h => (h.includes("estoque") && h.includes("vgv")) ),
-      estoqueQtd: headerCells.findIndex(h => (h.includes("estoque") && (h.includes("qtd")||h.includes("quant"))) ),
-      vso: headerCells.findIndex(h => h.includes("vso") || h.includes("% vso") || h.includes("percentual vso"))
-    };
-
-    function cellText(tr, idx) {
-      const cells = tr.querySelectorAll("td");
-      if (idx < 0 || idx >= cells.length) return "";
-      return (cells[idx].textContent || "").trim();
+    function findIdx(names) {
+      // names: array de possíveis nomes
+      for (const nm of names) {
+        const idx = header.findIndex(h => h.includes(nm));
+        if (idx !== -1) return idx;
+      }
+      return -1;
     }
 
-    const data = [];
-    for (let i = 1; i < rows.length; i++) {
-      const tr = rows[i];
-      const tds = tr.querySelectorAll("td");
-      if (!tds || tds.length === 0) continue;
+    const idxMap = {
+      empresa:      findIdx(["empresa"]),
+      mes:          findIdx(["mes", "mês"]),
+      ano:          findIdx(["ano", "year"]),
+      linhaProduto: findIdx(["linha de produto","linha produto","linha"]),
+      produto:      findIdx(["produto","empreendimento"]),
+      metaVGV:      findIdx(["meta vgv","meta_vgv","meta  vgv","meta","vgv meta"]),
+      realVGV:      findIdx(["real vgv","real_vgv","real  vgv","real","vgv real"]),
+      metaQtd:      findIdx(["meta qtd","meta_qtd","meta quantidade","meta qtde","meta unidades"]),
+      realQtd:      findIdx(["real qtd","real_qtd","real quantidade","real qtde","real unidades"]),
+      estoqueVGV:   findIdx(["estoque vgv","vgv estoque"]),
+      estoqueQtd:   findIdx(["estoque qtd","estoque quantidade","estoque unidades"]),
+      vso:          findIdx(["vso","% vso","percentual vso"])
+    };
 
+    const data = [];
+    for (let r = 1; r < rows.length; r++) {
+      const cells = rows[r];
+      if (!cells || cells.length === 0) continue;
+      const get = (i) => (i >= 0 && i < cells.length ? (cells[i] ?? "").toString().trim() : "");
       const obj = {
-        empresa: cellText(tr, headerMap.empresa),
-        mes: cellText(tr, headerMap.mes),
-        ano: cellText(tr, headerMap.ano),
-        linhaProduto: cellText(tr, headerMap.linhaProduto),
-        produto: cellText(tr, headerMap.produto),
-        metaVGV: cellText(tr, headerMap.metaVGV),
-        realVGV: cellText(tr, headerMap.realVGV),
-        metaQtd: cellText(tr, headerMap.metaQtd),
-        realQtd: cellText(tr, headerMap.realQtd),
-        estoqueVGV: cellText(tr, headerMap.estoqueVGV),
-        estoqueQtd: cellText(tr, headerMap.estoqueQtd),
-        vso: cellText(tr, headerMap.vso)
+        empresa:      get(idxMap.empresa),
+        mes:          get(idxMap.mes),
+        ano:          get(idxMap.ano),
+        linhaProduto: get(idxMap.linhaProduto),
+        produto:      get(idxMap.produto),
+        metaVGV:      get(idxMap.metaVGV),
+        realVGV:      get(idxMap.realVGV),
+        metaQtd:      get(idxMap.metaQtd),
+        realQtd:      get(idxMap.realQtd),
+        estoqueVGV:   get(idxMap.estoqueVGV),
+        estoqueQtd:   get(idxMap.estoqueQtd),
+        vso:          get(idxMap.vso)
       };
-      // Pula linhas totalmente vazias
-      const values = Object.values(obj).join("");
-      if (values.trim() === "") continue;
+      // pula linhas vazias
+      if (Object.values(obj).join("").trim() === "") continue;
       data.push(obj);
     }
     csvData = data;
-    // Se existir função global de inicialização, chamamos.
+
     if (typeof initDashboardFromData === "function") {
       initDashboardFromData(csvData);
     } else if (typeof rebuildAllFromData === "function") {
       rebuildAllFromData(csvData);
     } else {
-      // fallback: dispara evento customizado
       document.dispatchEvent(new CustomEvent("csvDataLoaded", { detail: csvData }));
     }
   } catch (err) {
-    console.error("Falha ao carregar planilha publicada:", err);
-    // mantém csvData vazio e deixa a UI mostrar zero/dash
+    console.error("Falha ao carregar CSV publicado:", err);
+    // avisa visualmente se existir área de status
+    const el = document.getElementById("status-sheet");
+    if (el) el.textContent = "Erro ao carregar a planilha (CSV). Verifique se está publicada na Web e recarregue.";
   }
 }
 
-// Chama logo após load para garantir DOM pronto
 window.addEventListener("load", () => {
   loadSheetData();
 });
-// === FIM: Carregamento automático da Google Planilha publicada ===
+// === FIM: Carregamento automático via CSV ===
+
 
         
         let rawData = [];
